@@ -1,0 +1,14 @@
+{
+    "adapter": "以太网",
+    "portal_login_url": "http://10.2.5.251:801/eportal/?c=Portal&a=login&login_method=1",
+    "portal_logout_url": "http://10.2.5.251:801/eportal/?c=Portal&a=logout",
+    "schedule": {
+        "monday":    {"disable": "23:30", "enable": "07:00"},
+        "tuesday":   {"disable": "23:30", "enable": "07:00"},
+        "wednesday": {"disable": "23:30", "enable": "07:00"},
+        "thursday":  {"disable": "23:30", "enable": "07:00"},
+        "friday":    {"disable": null,    "enable": "07:00"},
+        "saturday":  {"disable": null,    "enable": null},
+        "sunday":    {"disable": "23:30", "enable": null}
+    }
+}

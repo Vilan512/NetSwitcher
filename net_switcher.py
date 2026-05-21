@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import winreg
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -84,6 +85,35 @@ def get_today_schedule(cfg: dict) -> dict:
         "disable": _parse_time(day_cfg.get("disable")),
         "enable": _parse_time(day_cfg.get("enable")),
     }
+
+
+# ---------------------------------------------------------------------------
+# 开机自启 (注册表)
+# ---------------------------------------------------------------------------
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+APP_NAME = "NetSwitcher"
+
+
+def is_autostart_enabled() -> bool:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as key:
+            val, _ = winreg.QueryValueEx(key, APP_NAME)
+            return bool(val)
+    except FileNotFoundError:
+        return False
+
+
+def set_autostart(enable: bool):
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if enable:
+            exe_path = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, f'"{exe_path}"')
+        else:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +460,7 @@ class TrayApp:
             pystray.MenuItem("手动启用以太网 (联网+登录)", self._on_enable),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("账号设置", self._on_settings),
+            pystray.MenuItem("开机自启动", self._on_toggle_autostart, checked=lambda *_: is_autostart_enabled()),
             pystray.MenuItem("重新加载配置", self._on_reload),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出", self._on_quit),
@@ -448,6 +479,10 @@ class TrayApp:
 
     def _on_settings(self, *_):
         threading.Thread(target=show_settings_dialog, daemon=True).start()
+
+    def _on_toggle_autostart(self, *_):
+        new_state = not is_autostart_enabled()
+        set_autostart(new_state)
 
     def _on_reload(self, *_):
         self.config = load_config()

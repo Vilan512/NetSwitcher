@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import winreg
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
@@ -20,7 +21,7 @@ import pystray
 from PIL import Image, ImageDraw
 
 # ---------------------------------------------------------------------------
-# 路径
+# 路径 & 常量
 # ---------------------------------------------------------------------------
 
 if getattr(sys, "frozen", False):
@@ -30,6 +31,7 @@ else:
 
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 CRED_FILE = r"C:\Users\Public\Documents\user.info"
+LOG_FILE = os.path.join(tempfile.gettempdir(), "net_switcher.log")
 
 DAY_KEYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 DAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -41,8 +43,32 @@ ISP_SUFFIXES = {
     "无后缀": "",
 }
 
+_log_lock = threading.Lock()
+_config_lock = threading.Lock()
+
+
 # ---------------------------------------------------------------------------
-# 配置读写
+# 日志（自动截断，最多保留 500 行）
+# ---------------------------------------------------------------------------
+
+def dbg(msg: str):
+    with _log_lock:
+        try:
+            lines = []
+            if os.path.exists(LOG_FILE):
+                with open(LOG_FILE, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            lines.append(f"[{datetime.now().strftime('%m-%d %H:%M:%S')}] {msg}\n")
+            if len(lines) > 500:
+                lines = lines[-300:]
+            with open(LOG_FILE, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 配置读写（线程安全）
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONFIG = {
@@ -62,23 +88,28 @@ DEFAULT_CONFIG = {
 
 
 def load_config() -> dict:
-    if not os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=4)
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    with _config_lock:
+        if not os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=4)
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return dict(DEFAULT_CONFIG)
 
 
 def _parse_time(time_str: str) -> tuple[int, int] | None:
-    """解析 'HH:MM' 字符串，返回 (hour, minute)。"""
     if not time_str:
         return None
-    parts = time_str.split(":")
-    return int(parts[0]), int(parts[1])
+    try:
+        parts = time_str.split(":")
+        return int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        return None
 
 
 def get_today_schedule(cfg: dict) -> dict:
-    """返回今天的 {'disable': (h,m)|None, 'enable': (h,m)|None}。"""
     day_key = DAY_KEYS[datetime.now().weekday()]
     day_cfg = cfg.get("schedule", {}).get(day_key, {})
     return {
@@ -87,15 +118,38 @@ def get_today_schedule(cfg: dict) -> dict:
     }
 
 
+def find_next_task(cfg: dict) -> tuple[str, tuple[int, int], datetime] | None:
+    """从现在开始往后找最近的一个 disable/enable 任务，最多搜 8 天。"""
+    now = datetime.now()
+    for offset in range(8):
+        day = now + timedelta(days=offset)
+        day_key = DAY_KEYS[day.weekday()]
+        day_cfg = cfg.get("schedule", {}).get(day_key, {})
+        for action in ("disable", "enable"):
+            t = _parse_time(day_cfg.get(action))
+            if t:
+                target = day.replace(hour=t[0], minute=t[1], second=0, microsecond=0)
+                if target > now:
+                    return action, t, target
+    return None
+
+
 # ---------------------------------------------------------------------------
-# 开机自启 (注册表)
+# 开机自启 (任务计划)
 # ---------------------------------------------------------------------------
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 APP_NAME = "NetSwitcher"
+TASK_NAME = "NetSwitcher_AutoStart"
 
 
 def is_autostart_enabled() -> bool:
+    r = subprocess.run(
+        ["schtasks", "/Query", "/TN", TASK_NAME],
+        capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if r.returncode == 0:
+        return True
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as key:
             val, _ = winreg.QueryValueEx(key, APP_NAME)
@@ -105,15 +159,24 @@ def is_autostart_enabled() -> bool:
 
 
 def set_autostart(enable: bool):
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
-        if enable:
-            exe_path = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
-            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, f'"{exe_path}"')
-        else:
-            try:
-                winreg.DeleteValue(key, APP_NAME)
-            except FileNotFoundError:
-                pass
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, APP_NAME)
+    except FileNotFoundError:
+        pass
+
+    exe_path = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
+    if enable:
+        subprocess.run(
+            ["schtasks", "/Create", "/F", "/TN", TASK_NAME,
+             "/TR", f'"{exe_path}"', "/SC", "ONLOGON", "/RL", "HIGHEST", "/DELAY", "0000:30"],
+            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    else:
+        subprocess.run(
+            ["schtasks", "/Delete", "/F", "/TN", TASK_NAME],
+            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +200,7 @@ def run_as_admin():
 
 def load_credentials() -> tuple[str, str]:
     try:
-        with open(CRED_FILE, "r", encoding="utf-8") as f:
+        with open(CRED_FILE, "r", encoding="utf-8-sig") as f:
             text = f.read()
         account, password = "", ""
         for part in text.split("&"):
@@ -146,13 +209,16 @@ def load_credentials() -> tuple[str, str]:
             elif part.startswith("user_password="):
                 password = part.split("=", 1)[1]
         return account, password
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError):
         return "", ""
 
 
 def save_credentials(account: str, password: str):
-    with open(CRED_FILE, "w", encoding="utf-8") as f:
-        f.write(f"user_account={account}&user_password={password}")
+    try:
+        with open(CRED_FILE, "w", encoding="utf-8") as f:
+            f.write(f"user_account={account}&user_password={password}")
+    except OSError as e:
+        dbg(f"save_credentials failed: {e}")
 
 
 def detect_isp(account: str) -> str:
@@ -163,8 +229,16 @@ def detect_isp(account: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 校园网登录 / 登出
+# 校园网登录 / 登出（统一处理 JSONP）
 # ---------------------------------------------------------------------------
+
+def _parse_portal_response(raw: str) -> dict:
+    """处理 Dr.COM JSONP 响应 ({...}) → dict。"""
+    raw = raw.strip()
+    if raw.startswith("(") and raw.endswith(")"):
+        raw = raw[1:-1]
+    return json.loads(raw)
+
 
 def portal_login(account: str, password: str, url: str) -> tuple[bool, str]:
     if not account:
@@ -174,16 +248,19 @@ def portal_login(account: str, password: str, url: str) -> tuple[bool, str]:
         req = Request(url, data=body.encode("utf-8"), method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
         with urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+        data = _parse_portal_response(raw)
         result = data.get("result")
         msg = data.get("msg", "")
         ret_code = data.get("ret_code", "")
+        dbg(f"login: result={result} msg={msg} ret_code={ret_code}")
         if result == "1":
             return True, "登录成功"
         if ret_code == "2":
             return True, "已在线"
         return False, msg or f"登录失败 (ret_code={ret_code})"
     except Exception as e:
+        dbg(f"login exception: {e}")
         return False, str(e)
 
 
@@ -191,22 +268,30 @@ def portal_logout(url: str) -> tuple[bool, str]:
     try:
         req = Request(url, method="POST")
         with urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+        data = _parse_portal_response(raw)
+        dbg(f"logout: result={data.get('result')} msg={data.get('msg', '')}")
         return data.get("result") == "1", data.get("msg", "")
     except Exception as e:
+        dbg(f"logout exception: {e}")
         return False, str(e)
 
 
 # ---------------------------------------------------------------------------
-# 网卡控制
+# 网卡控制（带超时）
 # ---------------------------------------------------------------------------
 
-def _run_ps(command: str) -> str:
-    result = subprocess.run(
-        ["powershell", "-NoProfile", "-Command", command],
-        capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW,
-    )
-    return result.stdout.strip()
+def _run_ps(command: str, timeout: int = 30) -> str:
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        dbg(f"PowerShell timeout: {command[:80]}")
+        return ""
 
 
 def get_adapter_status(adapter: str) -> str:
@@ -228,11 +313,25 @@ def enable_adapter(adapter: str):
     _run_ps(f'Enable-NetAdapter -Name "{adapter}" -Confirm:$false')
 
 
+def wait_adapter_status(adapter: str, target: str, timeout: int = 15) -> bool:
+    """等待网卡达到目标状态，返回是否成功。"""
+    for _ in range(timeout):
+        if target in get_adapter_status(adapter):
+            return True
+        time.sleep(1)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # 设置窗口 (PowerShell WinForms)
 # ---------------------------------------------------------------------------
 
-def show_settings_dialog():
+def _ps_escape(s: str) -> str:
+    """转义 PowerShell 字符串中的特殊字符。"""
+    return s.replace('"', '`"').replace('$', '`$')
+
+
+def show_settings_dialog() -> bool:
     account, password = load_credentials()
     current_isp = detect_isp(account)
     pure_account = account
@@ -261,7 +360,7 @@ def show_settings_dialog():
             '$txtAccount = New-Object System.Windows.Forms.TextBox\n'
             '$txtAccount.Location = New-Object System.Drawing.Point(110, 17)\n'
             '$txtAccount.Size = New-Object System.Drawing.Size(230, 20)\n'
-            f'$txtAccount.Text = "{pure_account}"\n'
+            f'$txtAccount.Text = "{_ps_escape(pure_account)}"\n'
             '$form.Controls.Add($txtAccount)\n'
             '$lbl2 = New-Object System.Windows.Forms.Label\n'
             '$lbl2.Text = "密码:"\n'
@@ -272,7 +371,7 @@ def show_settings_dialog():
             '$txtPass.Location = New-Object System.Drawing.Point(110, 52)\n'
             '$txtPass.Size = New-Object System.Drawing.Size(230, 20)\n'
             "$txtPass.PasswordChar = '*'\n"
-            f'$txtPass.Text = "{password}"\n'
+            f'$txtPass.Text = "{_ps_escape(password)}"\n'
             '$form.Controls.Add($txtPass)\n'
             '$lbl3 = New-Object System.Windows.Forms.Label\n'
             '$lbl3.Text = "运营商:"\n'
@@ -320,17 +419,18 @@ def show_settings_dialog():
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         return "SAVED" in result.stdout
-    except Exception:
+    except Exception as e:
+        dbg(f"settings dialog error: {e}")
         return False
     finally:
         try:
             os.remove(ps_path)
-        except Exception:
+        except OSError:
             pass
 
 
 # ---------------------------------------------------------------------------
-# 定时调度器
+# 定时调度器（跨天查找最近任务）
 # ---------------------------------------------------------------------------
 
 class Scheduler:
@@ -350,34 +450,20 @@ class Scheduler:
 
     def _schedule_next(self):
         cfg = self._get_config()
-        sched = get_today_schedule(cfg)
-        now = datetime.now()
+        result = find_next_task(cfg)
 
-        candidates = []
-        if sched["disable"]:
-            h, m = sched["disable"]
-            target = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            if target <= now:
-                target += timedelta(days=1)
-            candidates.append(("disable", target))
-        if sched["enable"]:
-            h, m = sched["enable"]
-            target = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            if target <= now:
-                target += timedelta(days=1)
-            candidates.append(("enable", target))
-
-        if not candidates:
-            # 今天没有定时任务，检查明天
+        if not result:
+            # 没有任务，60 秒后重试
             self._timer = threading.Timer(60, self._schedule_next)
             self._timer.daemon = True
             self._timer.start()
             return
 
-        action_key, next_time = min(candidates, key=lambda x: x[1])
-        delay = (next_time - now).total_seconds()
+        action_key, _, next_time = result
+        delay = max(0.5, (next_time - datetime.now()).total_seconds())
         action = self._on_disable if action_key == "disable" else self._on_enable
 
+        dbg(f"next: {action_key} at {next_time.strftime('%m-%d %H:%M')} (in {delay:.0f}s)")
         self._timer = threading.Timer(delay, self._run_and_reschedule, args=[action])
         self._timer.daemon = True
         self._timer.start()
@@ -414,20 +500,53 @@ class TrayApp:
         return self.config.get("adapter", "以太网")
 
     def run(self):
+        self._startup_check()
         self.scheduler.start()
         self._create_icon()
 
-    # ---- 核心动作 --------------------------------------------------------
+    def _startup_check(self):
+        """启动时：如果网卡禁用则先启用，然后尝试登录（已在线则无影响）。"""
+        if "禁用" in get_adapter_status(self.adapter):
+            # 网卡被禁用（可能是昨晚定时断的），检查是否该恢复
+            now = datetime.now()
+            for offset in range(1, 4):
+                day = now - timedelta(days=offset)
+                day_key = DAY_KEYS[day.weekday()]
+                day_cfg = self.config.get("schedule", {}).get(day_key, {})
+                enable_time = _parse_time(day_cfg.get("enable"))
+                if enable_time:
+                    h, m = enable_time
+                    target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                    if now > target:
+                        dbg(f"startup: past enable time {h:02d}:{m:02d}, enabling")
+                        self._do_enable()
+                        return
+            return
+        # 网卡已启用（睡眠恢复等情况），尝试重新登录确保会话有效
+        dbg("startup: adapter enabled, trying login to refresh session")
+        threading.Thread(target=self._login_only, daemon=True).start()
+
+    # ---- 核心动作（后台线程执行）-----------------------------------------
 
     def _do_disable(self):
+        dbg("do_disable: logout + disable adapter")
         portal_logout(self.config["portal_logout_url"])
         disable_adapter(self.adapter)
+        wait_adapter_status(self.adapter, "禁用")
         self._refresh()
 
     def _do_enable(self):
+        dbg("do_enable: enable adapter + login")
         enable_adapter(self.adapter)
+        if not wait_adapter_status(self.adapter, "启用"):
+            dbg("do_enable: adapter not ready after 15s")
+        self._login_only()
+
+    def _login_only(self):
+        """只登录，不操作网卡（用于睡眠恢复等场景）。"""
         account, password = load_credentials()
-        portal_login(account, password, self.config["portal_login_url"])
+        ok, msg = portal_login(account, password, self.config["portal_login_url"])
+        dbg(f"login_only: ok={ok} msg={msg}")
         self._refresh()
 
     # ---- 托盘 -----------------------------------------------------------
@@ -443,7 +562,8 @@ class TrayApp:
         self.icon.run()
 
     def _build_menu(self) -> pystray.Menu:
-        status_text = f"以太网状态: {get_adapter_status(self.adapter)}"
+        adapter = self.adapter
+        status_text = f"{adapter}状态: {get_adapter_status(adapter)}"
         sched = get_today_schedule(self.config)
         disable_str = f"{sched['disable'][0]:02d}:{sched['disable'][1]:02d}" if sched["disable"] else "无"
         enable_str = f"{sched['enable'][0]:02d}:{sched['enable'][1]:02d}" if sched["enable"] else "无"
@@ -467,6 +587,8 @@ class TrayApp:
         )
 
     def _refresh(self):
+        if not self.icon:
+            return
         enabled = "启用" in get_adapter_status(self.adapter)
         self.icon.icon = make_icon_image(enabled)
         self.icon.menu = self._build_menu()
@@ -478,14 +600,18 @@ class TrayApp:
         threading.Thread(target=self._do_enable, daemon=True).start()
 
     def _on_settings(self, *_):
-        threading.Thread(target=show_settings_dialog, daemon=True).start()
+        def _do():
+            if show_settings_dialog():
+                self._do_enable()
+        threading.Thread(target=_do, daemon=True).start()
 
     def _on_toggle_autostart(self, *_):
         new_state = not is_autostart_enabled()
         set_autostart(new_state)
 
     def _on_reload(self, *_):
-        self.config = load_config()
+        with _config_lock:
+            self.config = load_config()
         self.scheduler.cancel()
         self.scheduler.start()
         self._refresh()
@@ -502,6 +628,7 @@ class TrayApp:
 def main():
     if not is_admin():
         run_as_admin()
+    dbg("=== NetSwitcher started ===")
     TrayApp().run()
 
 

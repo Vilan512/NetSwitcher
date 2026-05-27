@@ -549,23 +549,42 @@ class TrayApp:
         self._create_icon()
 
     def _startup_check(self):
-        """启动时：如果网卡禁用则先启用，然后尝试登录（已在线则无影响）。"""
-        if "禁用" in get_adapter_status(self.adapter):
-            now = datetime.now()
-            for offset in range(1, 4):
-                day = now - timedelta(days=offset)
-                day_key = DAY_KEYS[day.weekday()]
-                day_cfg = self.config.get("schedule", {}).get(day_key, {})
-                enable_time = _parse_time(day_cfg.get("enable"))
-                if enable_time:
-                    h, m = enable_time
-                    target = now.replace(hour=h, minute=m, second=0, microsecond=0)
-                    if now > target:
-                        dbg(f"startup: past enable time {h:02d}:{m:02d}, enabling")
-                        self._do_enable()
-                        return
+        """启动时根据排程决定是否启用网卡/登录。"""
+        now = datetime.now()
+        # 往前找最近的排程动作（最多 4 天）
+        last_action = None
+        last_time = None
+        for offset in range(4):
+            day = now - timedelta(days=offset)
+            day_key = DAY_KEYS[day.weekday()]
+            day_cfg = self.config.get("schedule", {}).get(day_key, {})
+            for action in ("disable", "enable"):
+                t = _parse_time(day_cfg.get(action))
+                if t:
+                    candidate = day.replace(hour=t[0], minute=t[1], second=0, microsecond=0)
+                    if candidate <= now and (last_time is None or candidate > last_time):
+                        last_action = action
+                        last_time = candidate
+
+        dbg(f"startup: last_action={last_action} at {last_time}")
+
+        if last_action == "disable":
+            # 最近一次动作是断网 → 现在是断网时段，不该启用
+            dbg("startup: in disable window, skip enable")
             return
-        dbg("startup: adapter enabled, trying login to refresh session")
+
+        if last_action == "enable":
+            # 最近一次动作是恢复 → 应该启用 + 登录
+            if "禁用" in get_adapter_status(self.adapter):
+                dbg("startup: past enable time, enabling")
+                self._do_enable()
+            else:
+                dbg("startup: adapter enabled, refreshing login")
+                threading.Thread(target=self._login_only, daemon=True).start()
+            return
+
+        # 没找到排程（config 全是 null），直接尝试登录
+        dbg("startup: no schedule found, trying login")
         threading.Thread(target=self._login_only, daemon=True).start()
 
     # ---- 核心动作（后台线程，加 _net_lock 防并发）------------------------

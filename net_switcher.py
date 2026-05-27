@@ -7,6 +7,7 @@
 import ctypes
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -14,7 +15,7 @@ import threading
 import time
 import winreg
 from datetime import datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import urlencode, parse_qs
 from urllib.request import Request, urlopen
 
 import pystray
@@ -45,10 +46,11 @@ ISP_SUFFIXES = {
 
 _log_lock = threading.Lock()
 _config_lock = threading.Lock()
+_net_lock = threading.Lock()  # 保护网络操作（启用/禁用/登录/登出）
 
 
 # ---------------------------------------------------------------------------
-# 日志（自动截断，最多保留 500 行）
+# 日志（自动截断，最多保留 500 行；不记录密码）
 # ---------------------------------------------------------------------------
 
 def dbg(msg: str):
@@ -68,7 +70,7 @@ def dbg(msg: str):
 
 
 # ---------------------------------------------------------------------------
-# 配置读写（线程安全）
+# 配置读写
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONFIG = {
@@ -88,6 +90,7 @@ DEFAULT_CONFIG = {
 
 
 def load_config() -> dict:
+    """读取配置文件，加锁保证线程安全。"""
     with _config_lock:
         if not os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -99,14 +102,17 @@ def load_config() -> dict:
             return dict(DEFAULT_CONFIG)
 
 
-def _parse_time(time_str: str) -> tuple[int, int] | None:
-    if not time_str:
+def _parse_time(time_str) -> tuple[int, int] | None:
+    """解析 'HH:MM'，仅接受 00:00–23:59，非法值返回 None。"""
+    if not isinstance(time_str, str) or not time_str:
         return None
-    try:
-        parts = time_str.split(":")
-        return int(parts[0]), int(parts[1])
-    except (ValueError, IndexError):
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", time_str)
+    if not m:
         return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    if 0 <= h <= 23 and 0 <= mi <= 59:
+        return h, mi
+    return None
 
 
 def get_today_schedule(cfg: dict) -> dict:
@@ -119,8 +125,9 @@ def get_today_schedule(cfg: dict) -> dict:
 
 
 def find_next_task(cfg: dict) -> tuple[str, tuple[int, int], datetime] | None:
-    """从现在开始往后找最近的一个 disable/enable 任务，最多搜 8 天。"""
+    """收集未来 8 天所有有效任务，按 datetime 排序返回最近的一个。"""
     now = datetime.now()
+    candidates: list[tuple[str, tuple[int, int], datetime]] = []
     for offset in range(8):
         day = now + timedelta(days=offset)
         day_key = DAY_KEYS[day.weekday()]
@@ -130,8 +137,11 @@ def find_next_task(cfg: dict) -> tuple[str, tuple[int, int], datetime] | None:
             if t:
                 target = day.replace(hour=t[0], minute=t[1], second=0, microsecond=0)
                 if target > now:
-                    return action, t, target
-    return None
+                    candidates.append((action, t, target))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[2])
+    return candidates[0]
 
 
 # ---------------------------------------------------------------------------
@@ -159,24 +169,40 @@ def is_autostart_enabled() -> bool:
 
 
 def set_autostart(enable: bool):
+    # 清理旧的注册表方式
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
             winreg.DeleteValue(key, APP_NAME)
     except FileNotFoundError:
         pass
 
-    exe_path = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
     if enable:
-        subprocess.run(
+        # 源码模式下用 python 解释器启动脚本
+        if getattr(sys, "frozen", False):
+            exe_path = sys.executable
+            tr = f'"{exe_path}"'
+        else:
+            python = sys.executable
+            script = os.path.abspath(__file__)
+            tr = f'"{python}" "{script}"'
+        r = subprocess.run(
             ["schtasks", "/Create", "/F", "/TN", TASK_NAME,
-             "/TR", f'"{exe_path}"', "/SC", "ONLOGON", "/RL", "HIGHEST", "/DELAY", "0000:30"],
+             "/TR", tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/DELAY", "0000:30"],
             capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW,
         )
+        if r.returncode != 0:
+            dbg(f"set_autostart create failed: rc={r.returncode} stderr={r.stderr.strip()}")
+        else:
+            dbg("set_autostart: task created")
     else:
-        subprocess.run(
+        r = subprocess.run(
             ["schtasks", "/Delete", "/F", "/TN", TASK_NAME],
             capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW,
         )
+        if r.returncode != 0:
+            dbg(f"set_autostart delete failed: rc={r.returncode} stderr={r.stderr.strip()}")
+        else:
+            dbg("set_autostart: task deleted")
 
 
 # ---------------------------------------------------------------------------
@@ -195,19 +221,18 @@ def run_as_admin():
 
 
 # ---------------------------------------------------------------------------
-# 凭据读写
+# 凭据读写（用 parse_qs 解析，兼容密码含 & 或 = 的情况）
 # ---------------------------------------------------------------------------
 
 def load_credentials() -> tuple[str, str]:
+    """读取凭据文件。注意：明文存储于 Public Documents，仅限本地使用。"""
     try:
         with open(CRED_FILE, "r", encoding="utf-8-sig") as f:
-            text = f.read()
-        account, password = "", ""
-        for part in text.split("&"):
-            if part.startswith("user_account="):
-                account = part.split("=", 1)[1]
-            elif part.startswith("user_password="):
-                password = part.split("=", 1)[1]
+            text = f.read().strip()
+        # 兼容旧格式 user_account=X&user_password=Y 和标准 urlencode 格式
+        params = parse_qs(text, keep_blank_values=True)
+        account = params.get("user_account", [""])[0]
+        password = params.get("user_password", [""])[0]
         return account, password
     except (FileNotFoundError, OSError):
         return "", ""
@@ -215,8 +240,9 @@ def load_credentials() -> tuple[str, str]:
 
 def save_credentials(account: str, password: str):
     try:
+        body = urlencode({"user_account": account, "user_password": password})
         with open(CRED_FILE, "w", encoding="utf-8") as f:
-            f.write(f"user_account={account}&user_password={password}")
+            f.write(body)
     except OSError as e:
         dbg(f"save_credentials failed: {e}")
 
@@ -253,7 +279,7 @@ def portal_login(account: str, password: str, url: str) -> tuple[bool, str]:
         result = data.get("result")
         msg = data.get("msg", "")
         ret_code = data.get("ret_code", "")
-        dbg(f"login: result={result} msg={msg} ret_code={ret_code}")
+        dbg(f"login: result={result} ret_code={ret_code}")
         if result == "1":
             return True, "登录成功"
         if ret_code == "2":
@@ -270,7 +296,7 @@ def portal_logout(url: str) -> tuple[bool, str]:
         with urlopen(req, timeout=10) as resp:
             raw = resp.read().decode("utf-8")
         data = _parse_portal_response(raw)
-        dbg(f"logout: result={data.get('result')} msg={data.get('msg', '')}")
+        dbg(f"logout: result={data.get('result')}")
         return data.get("result") == "1", data.get("msg", "")
     except Exception as e:
         dbg(f"logout exception: {e}")
@@ -278,45 +304,64 @@ def portal_logout(url: str) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# 网卡控制（带超时）
+# 网卡控制（带超时，注入防护）
 # ---------------------------------------------------------------------------
 
-def _run_ps(command: str, timeout: int = 30) -> str:
+def _ps_escape_param(s: str) -> str:
+    """转义 PowerShell 参数中的危险字符，防止注入。"""
+    return s.replace('"', '').replace("'", "").replace(";", "").replace("`", "").replace("\n", "").replace("\r", "")
+
+
+def _run_ps(command: str, timeout: int = 30) -> tuple[str, str, int]:
+    """执行 PowerShell 命令，返回 (stdout, stderr, returncode)。"""
     try:
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", command],
             capture_output=True, text=True, timeout=timeout,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
-        return result.stdout.strip()
+        return result.stdout.strip(), result.stderr.strip(), result.returncode
     except subprocess.TimeoutExpired:
         dbg(f"PowerShell timeout: {command[:80]}")
-        return ""
+        return "", "timeout", -1
 
 
 def get_adapter_status(adapter: str) -> str:
-    try:
-        out = _run_ps(
-            f'Get-NetAdapter -Name "{adapter}" '
-            f"| Select-Object -ExpandProperty Status"
-        )
-        return "已启用" if "Up" in out else "已禁用"
-    except Exception:
+    """返回 '已启用' / '已禁用' / '已断开' / '未知'。"""
+    safe = _ps_escape_param(adapter)
+    stdout, stderr, rc = _run_ps(
+        f'Get-NetAdapter -Name "{safe}" '
+        f"| Select-Object -ExpandProperty Status"
+    )
+    if rc != 0 or not stdout:
+        if stderr:
+            dbg(f"get_adapter_status failed: {stderr[:100]}")
         return "未知"
+    status = stdout.strip()
+    if status == "Up":
+        return "已启用"
+    if status in ("Disabled", "Down", "Not Present"):
+        return "已禁用"
+    if status == "Disconnected":
+        return "已断开"
+    dbg(f"get_adapter_status: unexpected status='{status}'")
+    return "未知"
 
 
 def disable_adapter(adapter: str):
-    _run_ps(f'Disable-NetAdapter -Name "{adapter}" -Confirm:$false')
+    safe = _ps_escape_param(adapter)
+    _run_ps(f'Disable-NetAdapter -Name "{safe}" -Confirm:$false')
 
 
 def enable_adapter(adapter: str):
-    _run_ps(f'Enable-NetAdapter -Name "{adapter}" -Confirm:$false')
+    safe = _ps_escape_param(adapter)
+    _run_ps(f'Enable-NetAdapter -Name "{safe}" -Confirm:$false')
 
 
-def wait_adapter_status(adapter: str, target: str, timeout: int = 15) -> bool:
-    """等待网卡达到目标状态，返回是否成功。"""
+def wait_adapter_status(adapter: str, target_keyword: str, timeout: int = 15) -> bool:
+    """等待网卡状态包含 target_keyword，返回是否成功。"""
     for _ in range(timeout):
-        if target in get_adapter_status(adapter):
+        if target_keyword in get_adapter_status(adapter):
             return True
         time.sleep(1)
     return False
@@ -326,8 +371,8 @@ def wait_adapter_status(adapter: str, target: str, timeout: int = 15) -> bool:
 # 设置窗口 (PowerShell WinForms)
 # ---------------------------------------------------------------------------
 
-def _ps_escape(s: str) -> str:
-    """转义 PowerShell 字符串中的特殊字符。"""
+def _ps_escape_str(s: str) -> str:
+    """转义 PowerShell 双引号字符串中的特殊字符。"""
     return s.replace('"', '`"').replace('$', '`$')
 
 
@@ -360,7 +405,7 @@ def show_settings_dialog() -> bool:
             '$txtAccount = New-Object System.Windows.Forms.TextBox\n'
             '$txtAccount.Location = New-Object System.Drawing.Point(110, 17)\n'
             '$txtAccount.Size = New-Object System.Drawing.Size(230, 20)\n'
-            f'$txtAccount.Text = "{_ps_escape(pure_account)}"\n'
+            f'$txtAccount.Text = "{_ps_escape_str(pure_account)}"\n'
             '$form.Controls.Add($txtAccount)\n'
             '$lbl2 = New-Object System.Windows.Forms.Label\n'
             '$lbl2.Text = "密码:"\n'
@@ -371,7 +416,7 @@ def show_settings_dialog() -> bool:
             '$txtPass.Location = New-Object System.Drawing.Point(110, 52)\n'
             '$txtPass.Size = New-Object System.Drawing.Size(230, 20)\n'
             "$txtPass.PasswordChar = '*'\n"
-            f'$txtPass.Text = "{_ps_escape(password)}"\n'
+            f'$txtPass.Text = "{_ps_escape_str(password)}"\n'
             '$form.Controls.Add($txtPass)\n'
             '$lbl3 = New-Object System.Windows.Forms.Label\n'
             '$lbl3.Text = "运营商:"\n'
@@ -430,7 +475,7 @@ def show_settings_dialog() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 定时调度器（跨天查找最近任务）
+# 定时调度器
 # ---------------------------------------------------------------------------
 
 class Scheduler:
@@ -453,7 +498,6 @@ class Scheduler:
         result = find_next_task(cfg)
 
         if not result:
-            # 没有任务，60 秒后重试
             self._timer = threading.Timer(60, self._schedule_next)
             self._timer.daemon = True
             self._timer.start()
@@ -507,7 +551,6 @@ class TrayApp:
     def _startup_check(self):
         """启动时：如果网卡禁用则先启用，然后尝试登录（已在线则无影响）。"""
         if "禁用" in get_adapter_status(self.adapter):
-            # 网卡被禁用（可能是昨晚定时断的），检查是否该恢复
             now = datetime.now()
             for offset in range(1, 4):
                 day = now - timedelta(days=offset)
@@ -522,31 +565,47 @@ class TrayApp:
                         self._do_enable()
                         return
             return
-        # 网卡已启用（睡眠恢复等情况），尝试重新登录确保会话有效
         dbg("startup: adapter enabled, trying login to refresh session")
         threading.Thread(target=self._login_only, daemon=True).start()
 
-    # ---- 核心动作（后台线程执行）-----------------------------------------
+    # ---- 核心动作（后台线程，加 _net_lock 防并发）------------------------
 
     def _do_disable(self):
-        dbg("do_disable: logout + disable adapter")
-        portal_logout(self.config["portal_logout_url"])
-        disable_adapter(self.adapter)
-        wait_adapter_status(self.adapter, "禁用")
-        self._refresh()
+        with _net_lock:
+            dbg("do_disable: logout + disable adapter")
+            portal_logout(self.config["portal_logout_url"])
+            disable_adapter(self.adapter)
+            wait_adapter_status(self.adapter, "未知")  # Disabled → "未知" 或 "已禁用"
+            self._refresh()
 
     def _do_enable(self):
-        dbg("do_enable: enable adapter + login")
-        enable_adapter(self.adapter)
-        if not wait_adapter_status(self.adapter, "启用"):
-            dbg("do_enable: adapter not ready after 15s")
-        self._login_only()
+        with _net_lock:
+            dbg("do_enable: enable adapter + login")
+            enable_adapter(self.adapter)
+            # 等待网卡 Up（可能需要较长时间，尤其从 Disconnected 恢复）
+            if not wait_adapter_status(self.adapter, "已启用", timeout=30):
+                dbg("do_enable: adapter not ready after 30s, trying login anyway")
+            # 登录重试（最多 3 次，间隔 5 秒）
+            for attempt in range(3):
+                account, password = load_credentials()
+                ok, msg = portal_login(account, password, self.config["portal_login_url"])
+                dbg(f"do_enable: login attempt={attempt+1} ok={ok} msg={msg}")
+                if ok:
+                    break
+                if attempt < 2:
+                    time.sleep(5)
+            self._refresh()
 
     def _login_only(self):
         """只登录，不操作网卡（用于睡眠恢复等场景）。"""
+        with _net_lock:
+            self._login_only_inner()
+
+    def _login_only_inner(self):
+        """内部调用，假设已持有 _net_lock。"""
         account, password = load_credentials()
         ok, msg = portal_login(account, password, self.config["portal_login_url"])
-        dbg(f"login_only: ok={ok} msg={msg}")
+        dbg(f"login: ok={ok} msg={msg}")
         self._refresh()
 
     # ---- 托盘 -----------------------------------------------------------
@@ -610,8 +669,8 @@ class TrayApp:
         set_autostart(new_state)
 
     def _on_reload(self, *_):
-        with _config_lock:
-            self.config = load_config()
+        # load_config() 内部已加锁，此处不要再包 _config_lock
+        self.config = load_config()
         self.scheduler.cancel()
         self.scheduler.start()
         self._refresh()
